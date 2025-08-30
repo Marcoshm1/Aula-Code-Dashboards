@@ -1,297 +1,382 @@
-# app.py — Dashboard de RH (versão ajustada com tratamento de erros visível)
-# Como rodar:
-# 1) Ative a venv  ->  .venv\Scripts\Activate.ps1   (Windows)  |  source .venv/bin/activate  (Mac/Linux)
-# 2) Instale deps  ->  pip install streamlit pandas numpy plotly openpyxl python-dateutil
-# 3) Rode          ->  streamlit run app.py
-
-import os
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 from datetime import date
+import os
+import io
 
-# --------------------- Configuração básica ---------------------
-st.set_page_config(page_title="Dashboard de RH", layout="wide")
-st.title("Dashboard de RH")
-
-# Se o arquivo estiver na mesma pasta do app.py, pode deixar assim.
-# Ajuste para o caminho local caso esteja em outra pasta (ex.: r"C:\...\BaseFuncionarios.xlsx")
-DEFAULT_EXCEL_PATH = "BaseFuncionarios.xlsx"
-DATE_COLS = ["Data de Nascimento", "Data de Contratacao", "Data de Demissao"]
-
-# --------------------- Funções utilitárias ---------------------
-def brl(x: float) -> str:
-    try:
-        return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return "R$ 0,00"
-
-def prepare_df(df: pd.DataFrame) -> pd.DataFrame:
-    # Padroniza textos
-    for c in df.select_dtypes(include="object").columns:
-        df[c] = df[c].astype(str).str.strip()
-
-    # Datas
-    for c in DATE_COLS:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], dayfirst=True, errors="coerce")
-
-    # Padroniza Sexo
-    if "Sexo" in df.columns:
-        df["Sexo"] = (
-            df["Sexo"].str.upper()
-            .replace({"MASCULINO": "M", "FEMININO": "F"})
-        )
-
-    # Garante numéricos
-    for col in ["Salario Base", "Impostos", "Beneficios", "VT", "VR"]:
-        if col not in df.columns:
-            df[col] = 0.0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    # Colunas derivadas
-    today = pd.Timestamp(date.today())
-
-    if "Data de Nascimento" in df.columns:
-        df["Idade"] = ((today - df["Data de Nascimento"]).dt.days // 365).clip(lower=0)
-
-    if "Data de Contratacao" in df.columns:
-        meses = (today.year - df["Data de Contratacao"].dt.year) * 12 + \
-                (today.month - df["Data de Contratacao"].dt.month)
-        df["Tempo de Casa (meses)"] = meses.clip(lower=0)
-
-    if "Data de Demissao" in df.columns:
-        df["Status"] = np.where(df["Data de Demissao"].notna(), "Desligado", "Ativo")
-    else:
-        df["Status"] = "Ativo"
-
-    df["Custo Total Mensal"] = df[["Salario Base", "Impostos", "Beneficios", "VT", "VR"]].sum(axis=1)
-    return df
-
-@st.cache_data
-def load_from_path(path: str) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name=0, engine="openpyxl")
-    return prepare_df(df)
-
-@st.cache_data
-def load_from_bytes(uploaded_bytes) -> pd.DataFrame:
-    df = pd.read_excel(uploaded_bytes, sheet_name=0, engine="openpyxl")
-    return prepare_df(df)
-
-# --------------------- Sidebar: fonte de dados ---------------------
-with st.sidebar:
-    st.header("Fonte de dados")
-    st.caption("Use **Upload** ou informe o caminho do arquivo .xlsx")
-    up = st.file_uploader("Carregar Excel (.xlsx)", type=["xlsx"])
-    caminho_manual = st.text_input("Ou caminho do Excel", value=DEFAULT_EXCEL_PATH)
-    st.divider()
-    if up is None:
-        existe = os.path.exists(caminho_manual)
-        st.write(f"Arquivo em caminho: **{caminho_manual}**")
-        st.write("Existe: ", "✅ Sim" if existe else "❌ Não")
-
-# --------------------- Carregamento com erros visíveis ---------------------
-df = None
-fonte = None
-if up is not None:
-    try:
-        df = load_from_bytes(up)
-        fonte = "Upload"
-    except Exception as e:
-        st.error(f"Erro ao ler Excel (Upload): {e}")
-        st.stop()
-else:
-    try:
-        if not os.path.exists(caminho_manual):
-            st.error(f"Arquivo não encontrado em: {caminho_manual}")
-            st.info("Dica: coloque o .xlsx na mesma pasta do app.py ou ajuste o caminho acima.")
-            st.stop()
-        df = load_from_path(caminho_manual)
-        fonte = "Caminho"
-    except Exception as e:
-        st.error(f"Erro ao ler Excel (Caminho): {e}")
-        st.stop()
-
-st.caption(f"Dados carregados via **{fonte}**. Linhas: {len(df)} | Colunas: {len(df.columns)}")
-
-# Mostra colunas detectadas (ajuda no debug)
-with st.expander("Ver colunas detectadas"):
-    st.write(list(df.columns))
-
-# --------------------- Filtros ---------------------
-st.sidebar.header("Filtros")
-
-def msel(col_name: str):
-    if col_name in df.columns:
-        vals = sorted([v for v in df[col_name].dropna().unique()])
-        return st.sidebar.multiselect(col_name, vals)
-    return []
-
-area_sel   = msel("Área")
-nivel_sel  = msel("Nível")
-cargo_sel  = msel("Cargo")
-sexo_sel   = msel("Sexo")
-status_sel = msel("Status")
-nome_busca = st.sidebar.text_input("Buscar por Nome Completo")
-
-# Períodos
-def date_bounds(series: pd.Series):
-    s = series.dropna()
-    if s.empty:
-        return None
-    return (s.min().date(), s.max().date())
-
-contr_bounds = date_bounds(df["Data de Contratacao"]) if "Data de Contratacao" in df.columns else None
-demis_bounds = date_bounds(df["Data de Demissao"]) if "Data de Demissao" in df.columns else None
-
-if contr_bounds:
-    d1, d2 = st.sidebar.date_input("Período de Contratação", value=contr_bounds)
-else:
-    d1, d2 = None, None
-
-if demis_bounds:
-    d3, d4 = st.sidebar.date_input("Período de Demissão", value=demis_bounds)
-else:
-    d3, d4 = None, None
-
-# Sliders (idade e salário)
-if "Idade" in df.columns and not df["Idade"].dropna().empty:
-    ida_min, ida_max = int(df["Idade"].min()), int(df["Idade"].max())
-    faixa_idade = st.sidebar.slider("Faixa Etária", ida_min, ida_max, (ida_min, ida_max))
-else:
-    faixa_idade = None
-
-if "Salario Base" in df.columns and not df["Salario Base"].dropna().empty:
-    sal_min, sal_max = float(df["Salario Base"].min()), float(df["Salario Base"].max())
-    faixa_sal = st.sidebar.slider("Faixa de Salário Base", float(sal_min), float(sal_max), (float(sal_min), float(sal_max)))
-else:
-    faixa_sal = None
-
-# Aplica filtros
-df_f = df.copy()
-
-def apply_in(df_, col, values):
-    if values and col in df_.columns:
-        return df_[df_[col].isin(values)]
-    return df_
-
-df_f = apply_in(df_f, "Área", area_sel)
-df_f = apply_in(df_f, "Nível", nivel_sel)
-df_f = apply_in(df_f, "Cargo", cargo_sel)
-df_f = apply_in(df_f, "Sexo", sexo_sel)
-df_f = apply_in(df_f, "Status", status_sel)
-
-if nome_busca and "Nome Completo" in df_f.columns:
-    df_f = df_f[df_f["Nome Completo"].str.contains(nome_busca, case=False, na=False)]
-
-if faixa_idade and "Idade" in df_f.columns:
-    df_f = df_f[(df_f["Idade"] >= faixa_idade[0]) & (df_f["Idade"] <= faixa_idade[1])]
-
-if faixa_sal and "Salario Base" in df_f.columns:
-    df_f = df_f[(df_f["Salario Base"] >= faixa_sal[0]) & (df_f["Salario Base"] <= faixa_sal[1])]
-
-if d1 and d2 and "Data de Contratacao" in df_f.columns:
-    df_f = df_f[(df_f["Data de Contratacao"].isna()) |
-                ((df_f["Data de Contratacao"] >= pd.to_datetime(d1)) &
-                 (df_f["Data de Contratacao"] <= pd.to_datetime(d2)))]
-
-if d3 and d4 and "Data de Demissao" in df_f.columns:
-    df_f = df_f[(df_f["Data de Demissao"].isna()) |
-                ((df_f["Data de Demissao"] >= pd.to_datetime(d3)) &
-                 (df_f["Data de Demissao"] <= pd.to_datetime(d4)))]
-
-# --------------------- KPIs ---------------------
-def k_headcount_ativo(d): 
-    return int((d["Status"] == "Ativo").sum()) if "Status" in d.columns else 0
-
-def k_desligados(d): 
-    return int((d["Status"] == "Desligado").sum()) if "Status" in d.columns else 0
-
-def k_folha(d):
-    return float(d.loc[d["Status"] == "Ativo", "Salario Base"].sum()) \
-        if ("Status" in d.columns and "Salario Base" in d.columns) else 0.0
-
-def k_custo_total(d):
-    return float(d.loc[d["Status"] == "Ativo", "Custo Total Mensal"].sum()) \
-        if ("Status" in d.columns and "Custo Total Mensal" in d.columns) else 0.0
-
-def k_idade_media(d):
-    return float(d["Idade"].mean()) if "Idade" in d.columns and len(d) > 0 else 0.0
-
-def k_tempo_casa_medio(d):
-    col = "Tempo de Casa (meses)"
-    return float(d[col].mean()) if col in d.columns and len(d) > 0 else 0.0
-
-def k_avaliacao_media(d):
-    col = "Avaliação do Funcionário"
-    return float(d[col].mean()) if col in d.columns and len(d) > 0 else 0.0
-
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Headcount Ativo", k_headcount_ativo(df_f))
-c2.metric("Desligados", k_desligados(df_f))
-c3.metric("Folha Salarial", brl(k_folha(df_f)))
-c4.metric("Custo Total", brl(k_custo_total(df_f)))
-c5.metric("Idade Média", f"{k_idade_media(df_f):.1f} anos")
-c6.metric("Avaliação Média", f"{k_avaliacao_media(df_f):.2f}")
-
-st.divider()
-
-# --------------------- Gráficos ---------------------
-colA, colB = st.columns(2)
-with colA:
-    if "Área" in df_f.columns:
-        d = df_f.groupby("Área").size().reset_index(name="Headcount")
-        if not d.empty:
-            fig = px.bar(d, x="Área", y="Headcount", title="Headcount por Área")
-            st.plotly_chart(fig, use_container_width=True)
-
-with colB:
-    if "Cargo" in df_f.columns and "Salario Base" in df_f.columns:
-        d = df_f.groupby("Cargo", as_index=False)["Salario Base"].mean().sort_values("Salario Base", ascending=False)
-        if not d.empty:
-            fig = px.bar(d, x="Cargo", y="Salario Base", title="Salário Médio por Cargo")
-            st.plotly_chart(fig, use_container_width=True)
-
-colC, colD = st.columns(2)
-with colC:
-    if "Idade" in df_f.columns and not df_f["Idade"].dropna().empty:
-        fig = px.histogram(df_f, x="Idade", nbins=20, title="Distribuição de Idade")
-        st.plotly_chart(fig, use_container_width=True)
-
-with colD:
-    if "Sexo" in df_f.columns:
-        d = df_f["Sexo"].value_counts().reset_index()
-        d.columns = ["Sexo", "Contagem"]
-        if not d.empty:
-            fig = px.pie(d, values="Contagem", names="Sexo", title="Distribuição por Sexo")
-            st.plotly_chart(fig, use_container_width=True)
-
-st.divider()
-
-# --------------------- Tabela e Downloads ---------------------
-st.subheader("Tabela (dados filtrados)")
-st.dataframe(df_f, use_container_width=True)
-
-csv_bytes = df_f.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Baixar CSV filtrado",
-    data=csv_bytes,
-    file_name="funcionarios_filtrado.csv",
-    mime="text/csv"
+# --- Configuração da página e injeção de estilo ---
+st.set_page_config(
+    page_title="Dashboard de RH",
+    page_icon="📊",
+    layout="wide"
 )
 
-# Exportar Excel filtrado (opcional)
-to_excel = st.toggle("Gerar Excel filtrado para download")
-if to_excel:
-    from io import BytesIO
-    buff = BytesIO()
-    with pd.ExcelWriter(buff, engine="openpyxl") as writer:
-        df_f.to_excel(writer, index=False, sheet_name="Filtrado")
-    st.download_button(
-        "Baixar Excel filtrado",
-        data=buff.getvalue(),
-        file_name="funcionarios_filtrado.xlsx",
+# Injeção de CSS para a fonte Inter e estilo customizado (Tema Claro)
+st.markdown("""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        
+        html, body, [class*="css"] {
+            font-family: 'Inter', sans-serif;
+            color: #333333;
+            background-color: #f0f2f6;
+        }
+
+        .stMetric {
+            background-color: #ffffff;
+            border-radius: 1rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1), 0 1px 3px rgba(0, 0, 0, 0.08);
+            padding: 1rem;
+            transition: transform 0.2s, box-shadow 0.2s;
+            text-align: center;
+        }
+        
+        .stMetric:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 15px rgba(0, 0, 0, 0.2), 0 4px 6px rgba(0, 0, 0, 0.05);
+        }
+
+        .stRadio > label {
+            font-weight: 600;
+        }
+
+        .stMultiSelect, .stSlider {
+            border-radius: 0.5rem;
+        }
+
+        .stApp {
+            background-color: #f0f2f6;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- Caminho padrão do arquivo Excel ---
+DEFAULT_EXCEL_PATH = "dados_rh.xlsx"
+
+# --- Função para criar um arquivo Excel de exemplo ---
+def create_sample_excel():
+    """
+    Cria e retorna um arquivo Excel de exemplo em memória.
+    """
+    data = {
+        'Nome Completo': ['Ana Silva', 'Bruno Costa', 'Carlos Mendes', 'Diana Souza', 'Eduarda Pereira', 'Fábio Gomes', 'Gabriel Rocha', 'Helena Martins', 'Isabela Lima', 'João Almeida'],
+        'Area': ['Vendas', 'Marketing', 'Vendas', 'Engenharia', 'Vendas', 'Marketing', 'Engenharia', 'Vendas', 'Engenharia', 'Vendas'],
+        'Nivel': ['Pleno', 'Senior', 'Junior', 'Pleno', 'Senior', 'Pleno', 'Junior', 'Pleno', 'Senior', 'Junior'],
+        'Cargo': ['Vendedor', 'Analista Mkt', 'Vendedor', 'Engenheiro', 'Gerente Vendas', 'Analista Mkt', 'Engenheiro', 'Vendedor', 'Engenheiro', 'Vendedor'],
+        'Sexo': ['Feminino', 'Masculino', 'Masculino', 'Feminino', 'Feminino', 'Masculino', 'Masculino', 'Feminino', 'Feminino', 'Masculino'],
+        'Data de Nascimento': ['1990-05-15', '1985-11-20', '1998-03-01', '1992-09-22', '1988-07-10', '1995-02-28', '2000-04-12', '1993-08-05', '1987-12-30', '1999-06-18'],
+        'Data de Contratacao': ['2018-01-10', '2015-06-25', '2021-09-15', '2019-03-20', '2014-05-01', '2017-08-08', '2022-01-30', '2018-02-14', '2013-10-17', '2020-04-05'],
+        'Data de Demissao': [np.nan, '2023-01-20', np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, '2023-11-10', np.nan],
+        'Salario Base': [4500, 8500, 3200, 7000, 12000, 6000, 4000, 4800, 9500, 3500],
+        'Impostos': [1200, 2500, 850, 2100, 3500, 1500, 1000, 1300, 2800, 900],
+        'Beneficios': [500, 700, 300, 600, 800, 550, 450, 420, 750, 350],
+        'VT': [150, 200, 150, 180, 200, 150, 150, 160, 200, 150],
+        'VR': [300, 400, 250, 350, 400, 300, 280, 320, 400, 280],
+        'Avaliacao do Funcionario': [8.5, 9.2, 7.8, 9.1, 9.5, 8.0, 7.5, 8.8, 9.0, 8.2]
+    }
+    df_sample = pd.DataFrame(data)
+    
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_sample.to_excel(writer, index=False, sheet_name='Sheet1')
+    output.seek(0)
+    return output
+
+# --- Função para carregar e pré-processar os dados com cache ---
+@st.cache_data
+def load_data(file_path=None, uploaded_file=None):
+    """
+    Carrega, limpa e pré-processa os dados de um arquivo Excel.
+    Se nenhum arquivo for encontrado/enviado, usa dados de exemplo.
+    """
+    df = None
+    
+    # Prioridade 1: Arquivo enviado pelo usuário
+    if uploaded_file:
+        try:
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        except Exception as e:
+            st.error(f"Erro ao ler o arquivo enviado. Verifique se o formato está correto. Erro: {e}")
+            return None
+    # Prioridade 2: Caminho padrão
+    elif file_path and os.path.exists(file_path):
+        try:
+            df = pd.read_excel(file_path, engine='openpyxl')
+        except Exception as e:
+            st.error(f"Erro ao ler o arquivo do caminho padrão. Verifique se o arquivo não está corrompido ou em uso. Erro: {e}")
+            return None
+    # Prioridade 3: Dados de exemplo (fallback)
+    else:
+        st.warning("Arquivo de dados não encontrado. Usando dados de exemplo para demonstração.")
+        df = pd.read_excel(create_sample_excel(), engine='openpyxl')
+
+
+    # --- Pré-processamento dos dados ---
+    # Renomear colunas para facilitar o uso (opcional, mas boa prática)
+    df.columns = [col.replace(' ', '_').replace('.', '').replace('ç', 'c').lower() for col in df.columns]
+
+    # Padronizar colunas de texto (strip e maiúsculas)
+    for col in ['nome_completo', 'area', 'cargo', 'nivel', 'sexo', 'status']:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip().str.upper()
+
+    # Converter colunas de data
+    for col in ['data_de_nascimento', 'data_de_contratacao', 'data_de_demissao']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+
+    # Normalizar valores de "Sexo"
+    if 'sexo' in df.columns:
+        df['sexo'] = df['sexo'].replace({'MASCULINO': 'M', 'FEMININO': 'F'})
+
+    # Garantir que colunas numéricas sejam floats e substituir nulos por 0.0
+    for col in ['salario_base', 'impostos', 'beneficios', 'vt', 'vr', 'avaliacao_do_funcionario']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+
+    # --- Criar colunas derivadas ---
+    # Idade
+    if 'data_de_contratacao' in df.columns:
+        today = date.today()
+        df['idade'] = df['data_de_contratacao'].apply(
+            lambda x: today.year - x.year - ((today.month, today.day) < (x.month, x.day)) if pd.notna(x) else np.nan
+        )
+
+    # Função para calcular a diferença em meses de forma confiável
+    def calculate_months_diff(d1, d2):
+        if pd.isna(d1) or pd.isna(d2):
+            return 0
+        return (d2.year - d1.year) * 12 + d2.month - d1.month
+    
+    # Tempo de Casa (meses) - Corrigido o erro
+    if 'data_de_contratacao' in df.columns:
+        df['tempo_de_casa_meses'] = df['data_de_contratacao'].apply(
+            lambda x: calculate_months_diff(x, pd.to_datetime('now'))
+        )
+        df['tempo_de_casa_meses'] = df['tempo_de_casa_meses'].apply(lambda x: int(x) if pd.notna(x) else 0)
+
+    # Status (Ativo/Desligado)
+    if 'data_de_demissao' in df.columns:
+        df['status'] = df['data_de_demissao'].apply(lambda x: 'DESLIGADO' if pd.notna(x) else 'ATIVO')
+
+    # Custo Total Mensal
+    custo_cols = ['salario_base', 'impostos', 'beneficios', 'vt', 'vr']
+    df['custo_total_mensal'] = df[custo_cols].sum(axis=1)
+
+    return df
+
+# --- Título principal e subtítulo ---
+st.title("📊 Dashboard de Recursos Humanos")
+st.markdown("Uma visão geral da força de trabalho da empresa.")
+
+# --- Interface de carregamento de dados ---
+st.sidebar.header("Carregamento de Dados")
+upload_option = st.sidebar.radio(
+    "Escolha uma opção de carregamento:",
+    ("Fazer upload do arquivo", "Usar arquivo padrão")
+)
+
+# Carrega os dados uma vez e armazena em uma variável de estado
+if 'original_df' not in st.session_state:
+    st.session_state.original_df = load_data()
+
+df_filtered = st.session_state.original_df.copy()
+
+if upload_option == "Fazer upload do arquivo":
+    uploaded_file = st.sidebar.file_uploader("Escolha um arquivo Excel (.xlsx)", type="xlsx")
+    if uploaded_file:
+        df_filtered = load_data(uploaded_file=uploaded_file)
+        st.session_state.original_df = df_filtered
+elif not os.path.exists(DEFAULT_EXCEL_PATH):
+    st.sidebar.info("Arquivo padrão não encontrado. Por favor, baixe o arquivo de exemplo ou faça um upload.")
+    
+    # Botão de download para o arquivo de exemplo
+    excel_sample = create_sample_excel()
+    st.sidebar.download_button(
+        label="📥 Baixar arquivo de exemplo",
+        data=excel_sample,
+        file_name="dados_rh_exemplo.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+st.sidebar.markdown("---")
+
+# Se o DataFrame for nulo, significa que houve um erro grave no carregamento
+if df_filtered is None or df_filtered.empty:
+    st.error("Não foi possível carregar os dados. Verifique o arquivo e tente novamente.")
+    st.stop()
     
+# --- Barra lateral com filtros ---
+st.sidebar.header("Filtros")
+
+# Filtro por Nome Completo
+nome_completo_search = st.sidebar.text_input("Buscar por Nome Completo:")
+if nome_completo_search:
+    df_filtered = df_filtered[df_filtered['nome_completo'].str.contains(nome_completo_search.upper())]
+
+# Multi-select para categorias (agora usando o DataFrame original para as opções)
+if 'area' in st.session_state.original_df.columns:
+    areas = st.sidebar.multiselect("Área", options=st.session_state.original_df['area'].unique(), default=st.session_state.original_df['area'].unique())
+    if areas: # Aplicar filtro apenas se houver seleção
+        df_filtered = df_filtered[df_filtered['area'].isin(areas)]
+if 'nivel' in st.session_state.original_df.columns:
+    niveis = st.sidebar.multiselect("Nível", options=st.session_state.original_df['nivel'].unique(), default=st.session_state.original_df['nivel'].unique())
+    if niveis: # Aplicar filtro apenas se houver seleção
+        df_filtered = df_filtered[df_filtered['nivel'].isin(niveis)]
+if 'cargo' in st.session_state.original_df.columns:
+    cargos = st.sidebar.multiselect("Cargo", options=st.session_state.original_df['cargo'].unique(), default=st.session_state.original_df['cargo'].unique())
+    if cargos: # Aplicar filtro apenas se houver seleção
+        df_filtered = df_filtered[df_filtered['cargo'].isin(cargos)]
+if 'sexo' in st.session_state.original_df.columns:
+    sexos = st.sidebar.multiselect("Sexo", options=st.session_state.original_df['sexo'].unique(), default=st.session_state.original_df['sexo'].unique())
+    if sexos: # Aplicar filtro apenas se houver seleção
+        df_filtered = df_filtered[df_filtered['sexo'].isin(sexos)]
+if 'status' in st.session_state.original_df.columns:
+    status = st.sidebar.multiselect("Status", options=st.session_state.original_df['status'].unique(), default=st.session_state.original_df['status'].unique())
+    if status: # Aplicar filtro apenas se houver seleção
+        df_filtered = df_filtered[df_filtered['status'].isin(status)]
+
+# Filtros por faixa de valores (sliders)
+if 'idade' in st.session_state.original_df.columns and not st.session_state.original_df['idade'].isnull().all():
+    min_idade = int(st.session_state.original_df['idade'].min())
+    max_idade = int(st.session_state.original_df['idade'].max())
+    idade_range = st.sidebar.slider("Faixa de Idade", min_idade, max_idade, (min_idade, max_idade))
+    df_filtered = df_filtered[(df_filtered['idade'] >= idade_range[0]) & (df_filtered['idade'] <= idade_range[1])]
+
+if 'salario_base' in st.session_state.original_df.columns and st.session_state.original_df['salario_base'].max() > 0:
+    min_salario, max_salario = float(st.session_state.original_df['salario_base'].min()), float(st.session_state.original_df['salario_base'].max())
+    salario_range = st.sidebar.slider("Faixa Salarial (R$)", min_salario, max_salario, (min_salario, max_salario))
+    df_filtered = df_filtered[(df_filtered['salario_base'] >= salario_range[0]) & (df_filtered['salario_base'] <= salario_range[1])]
+
+# Filtros por data
+if 'data_de_contratacao' in st.session_state.original_df.columns and not st.session_state.original_df['data_de_contratacao'].isnull().all():
+    min_contratacao = st.session_state.original_df['data_de_contratacao'].min().to_pydatetime()
+    max_contratacao = st.session_state.original_df['data_de_contratacao'].max().to_pydatetime()
+    contratacao_range = st.sidebar.slider(
+        "Período de Contratação",
+        min_value=min_contratacao,
+        max_value=max_contratacao,
+        value=(min_contratacao, max_contratacao),
+        format="YYYY-MM-DD"
+    )
+    df_filtered = df_filtered[(df_filtered['data_de_contratacao'] >= pd.to_datetime(contratacao_range[0])) & (df_filtered['data_de_contratacao'] <= pd.to_datetime(contratacao_range[1]))]
+    
+if 'data_de_demissao' in st.session_state.original_df.columns and not st.session_state.original_df['data_de_demissao'].isnull().all():
+    min_demissao = st.session_state.original_df['data_de_demissao'].min().to_pydatetime()
+    max_demissao = st.session_state.original_df['data_de_demissao'].max().to_pydatetime()
+    demissao_range = st.sidebar.slider(
+        "Período de Demissão",
+        min_value=min_demissao,
+        max_value=max_demissao,
+        value=(min_demissao, max_demissao),
+        format="YYYY-MM-DD"
+    )
+    df_filtered = df_filtered[(df_filtered['data_de_demissao'] >= pd.to_datetime(demissao_range[0])) & (df_filtered['data_de_demissao'] <= pd.to_datetime(demissao_range[1]))]
+
+# --- Verificação de dados após os filtros ---
+if df_filtered.empty:
+    st.warning("Nenhum dado encontrado com os filtros selecionados. Por favor, ajuste os filtros.")
+    st.stop()
+
+# --- Seção de KPIs principais ---
+st.header("Indicadores Chave de Performance (KPIs)")
+kpi_cols = st.columns(4)
+
+# Headcount Ativo
+ativo_df = df_filtered[df_filtered['status'] == 'ATIVO']
+headcount_ativo = len(ativo_df)
+kpi_cols[0].metric(label="Headcount Ativo", value=headcount_ativo)
+
+# Desligados
+desligados_df = df_filtered[df_filtered['status'] == 'DESLIGADO']
+desligados = len(desligados_df)
+kpi_cols[1].metric(label="Desligados", value=desligados)
+
+# Folha de Pagamento
+folha_pagamento = ativo_df['salario_base'].sum()
+kpi_cols[2].metric(label="Folha de Pagamento", value=f"R$ {folha_pagamento:,.2f}")
+
+# Custo Total
+custo_total = ativo_df['custo_total_mensal'].sum()
+kpi_cols[3].metric(label="Custo Total Mensal", value=f"R$ {custo_total:,.2f}")
+
+st.markdown("---")
+
+# --- Seção de KPIs de médias ---
+st.header("Médias Gerais")
+avg_kpi_cols = st.columns(3)
+
+# Idade Média
+if 'idade' in ativo_df.columns and not ativo_df['idade'].isnull().all():
+    idade_media = ativo_df['idade'].mean()
+    avg_kpi_cols[0].metric(label="Idade Média", value=f"{idade_media:.1f} anos")
+else:
+    avg_kpi_cols[0].metric(label="Idade Média", value="N/A")
+
+# Tempo Médio de Casa
+if 'tempo_de_casa_meses' in ativo_df.columns and not ativo_df['tempo_de_casa_meses'].isnull().all():
+    tempo_medio_casa = ativo_df['tempo_de_casa_meses'].mean()
+    avg_kpi_cols[1].metric(label="Tempo Médio de Casa", value=f"{tempo_medio_casa:.1f} meses")
+else:
+    avg_kpi_cols[1].metric(label="Tempo Médio de Casa", value="N/A")
+
+# Avaliação Média do Funcionário
+if 'avaliacao_do_funcionario' in ativo_df.columns and not ativo_df['avaliacao_do_funcionario'].isnull().all():
+    avaliacao_media = ativo_df['avaliacao_do_funcionario'].mean()
+    avg_kpi_cols[2].metric(label="Avaliação Média", value=f"{avaliacao_media:.2f}")
+else:
+    avg_kpi_cols[2].warning("Coluna 'Avaliação' não encontrada.")
+
+st.markdown("---")
+
+# --- Seção de Visualizações Gráficas ---
+st.header("Visualizações Gráficas")
+graficos_cols = st.columns(2)
+
+# Distribuição de Idade (Histograma)
+if 'idade' in df_filtered.columns:
+    fig_idade = px.histogram(df_filtered.dropna(subset=['idade']), x="idade", nbins=20, title="Distribuição de Idade",
+                             labels={'idade': 'Idade (anos)'}, color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig_idade.update_layout(bargap=0.1, template="plotly_white")
+    graficos_cols[0].plotly_chart(fig_idade, use_container_width=True)
+
+# Distribuição de Salário Base (Boxplot)
+if 'salario_base' in df_filtered.columns:
+    fig_salario = px.box(df_filtered.dropna(subset=['salario_base']), y="salario_base", title="Distribuição de Salário Base",
+                         labels={'salario_base': 'Salário Base (R$)'}, color_discrete_sequence=px.colors.qualitative.Pastel, template="plotly_white")
+    fig_salario.update_yaxes(tickprefix="R$ ")
+    graficos_cols[1].plotly_chart(fig_salario, use_container_width=True)
+
+# Funcionários por Área (Gráfico de Barras)
+if 'area' in df_filtered.columns:
+    area_counts = df_filtered['area'].value_counts().reset_index()
+    area_counts.columns = ['Área', 'Número de Funcionários']
+    fig_area = px.bar(area_counts, x="Área", y="Número de Funcionários", title="Funcionários por Área",
+                      text="Número de Funcionários", color_discrete_sequence=px.colors.qualitative.Pastel, template="plotly_white")
+    graficos_cols = st.columns(2)
+    graficos_cols[0].plotly_chart(fig_area, use_container_width=True)
+
+# Funcionários por Status (Pizza/Donut Chart)
+if 'status' in df_filtered.columns:
+    status_counts = df_filtered['status'].value_counts().reset_index()
+    status_counts.columns = ['Status', 'Número de Funcionários']
+    fig_status = px.pie(status_counts, values="Número de Funcionários", names="Status",
+                        title="Distribuição por Status", hole=0.5, color_discrete_sequence=px.colors.qualitative.Pastel, template="plotly_white")
+    graficos_cols[1].plotly_chart(fig_status, use_container_width=True)
+
+# Evolução do headcount por mês de contratação (Linha)
+if 'data_de_contratacao' in df_filtered.columns:
+    df_evolucao = df_filtered.sort_values('data_de_contratacao').copy()
+    df_evolucao['mes_ano_contratacao'] = df_evolucao['data_de_contratacao'].dt.to_period('M').astype(str)
+    df_evolucao['headcount'] = df_evolucao.groupby('mes_ano_contratacao').cumcount() + 1
+    
+    fig_evolucao = px.line(df_evolucao, x="mes_ano_contratacao", y="headcount", title="Evolução do Headcount por Contratação",
+                           labels={'mes_ano_contratacao': 'Mês/Ano de Contratação', 'headcount': 'Headcount Acumulado'}, color_discrete_sequence=px.colors.qualitative.Pastel, template="plotly_white")
+    st.plotly_chart(fig_evolucao, use_container_width=True)
+
+# --- Tabela final ---
+st.header("Dados Filtrados")
+st.dataframe(df_filtered)
